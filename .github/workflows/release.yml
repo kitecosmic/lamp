@@ -29,7 +29,9 @@ jobs:
           for a in synsema-linux-x86_64 synsema-macos-x86_64 synsema-macos-aarch64 synsema-windows-x86_64.exe; do
             curl -fsSL -o "donors/$a" "$SYNSEMA_RELEASE/$a"
             curl -fsSL -o "donors/$a.sha256" "$SYNSEMA_RELEASE/$a.sha256"
-            (cd donors && awk '{print $1}' "$a.sha256" | sed "s|\$|  $a|" | sha256sum -c -)
+            # .sha256 formats vary across assets (uppercase, CRLF, with or without a
+            # filename) — normalize to "hash  name" before checking.
+            (cd donors && awk '{print $1}' "$a.sha256" | tr -d '\r' | tr 'A-F' 'a-f' | sed "s|\$|  $a|" | sha256sum -c -)
           done
           chmod +x donors/synsema-linux-x86_64
 
