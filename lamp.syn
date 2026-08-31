@@ -30,7 +30,7 @@ require sandbox_run
 use "./core.syn" as core
 use "./mcp.syn" as mcp
 
-let VERSION be "0.1.1"
+let VERSION be "0.1.2"
 
 task opt(m, k, d)
     when contains(m, k)

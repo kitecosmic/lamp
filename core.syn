@@ -444,11 +444,12 @@ export task body_json(r)
 
 -- Tell the hub a pull happened — fire and forget, never in the way. The ping
 -- carries only the ref; set LAMP_NO_PING=1 to send nothing at all.
-task ping_hub(hub_ref)
+task ping_hub(hub_ref, repo, path)
     when env("LAMP_NO_PING", "") != ""
         give nothing
     try
-        http_post(env("LAMP_HUB", "https://lamps.sh") + "/api/pulls/" + hub_ref, "", {"User-Agent": "lamp"})
+        http_post(env("LAMP_HUB", "https://lamps.sh") + "/api/pulls/" + hub_ref,
+                  json_encode({"repo": repo, "path": path}), {"User-Agent": "lamp"})
         give nothing
     recover err
         give nothing
@@ -524,9 +525,9 @@ export task pull(ref)
             set hashes[f] to decode(sha256(body), "hex")
     let res be finish_pull(ref, dest, m, hashes, tag, prev)
     let hub_owner be p["owner"]
-    when starts_with(p["path"], "lamps/")
+    when p["owner"] == "kitecosmic" and p["repo"] == "lamps"
         set hub_owner to "lamps"
-    ping_hub(hub_owner + "/" + m["name"])
+    ping_hub(hub_owner + "/" + m["name"], p["repo"], p["path"])
     give res
 
 task pull_local(ref, dir)
