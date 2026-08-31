@@ -1,0 +1,166 @@
+-- mcp — the enabled lamps as MCP tools over stdio (JSON-RPC, one message per line).
+--
+-- Drop `lamp mcp` in any harness's mcp config and its tools join the model's
+-- catalog: lamp_<name>_<tool> for every enabled lamp, plus lamps_list, lamps_audit
+-- and — only when a human wrote a session ceiling with "eval": true — lamps_eval.
+-- Each tool's description states the ceiling the call will actually run under, and
+-- a lamp whose source asks above its own ceiling is offered with a warning: the
+-- human enabled it, the interpreter will refuse it, and the model should not spend
+-- a turn on a call that is already decided.
+
+use "./core.syn" as core
+
+task opt(m, k, d)
+    when contains(m, k)
+        give m[k]
+    give d
+
+task reply(id, result)
+    print(json_encode({"jsonrpc": "2.0", "id": id, "result": result}))
+    flush()
+
+task fail(id, message)
+    reply(id, {"content": [{"type": "text", "text": message}], "isError": true})
+
+task eval_description(ses)
+    give "Run a Synsema program under this session's capability ceiling: " + ses["ceiling"] + ". Declare what you need with 'require' lines (e.g. require net(\"host\")) — asking for anything outside the ceiling is refused for the whole run, so ask precisely and ask small. print() output is returned."
+
+task catalog()
+    let tools be [
+        {"name": "lamps_list",
+         "description": "List every installed lamp, its capability ceiling, whether it is enabled, and whether its source stays within what its manifest promises.",
+         "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "lamps_audit",
+         "description": "Every lamp call and eval on this machine: what was asked, what was granted, what was denied.",
+         "inputSchema": {"type": "object", "properties": {}}}]
+    let ses be core.session_conf()
+    when ses != nothing and opt(ses, "eval", false) and trim(core.text_or(opt(ses, "ceiling", ""), "")) != ""
+        set tools to append(tools, {"name": "lamps_eval",
+            "description": eval_description(ses),
+            "inputSchema": {"type": "object",
+                "properties": {"source": {"type": "string", "description": "Synsema source to run."}},
+                "required": ["source"]}})
+    each l in core.discover()
+        when opt(l, "enabled", false) and not contains(l, "broken")
+            let li be core.lint(l["manifest"]["caps"], l["source"])
+            let warn be ""
+            when not li["keeps_promise"]
+                set warn to " · WARNING: this lamp's source asks for " + join(li["overreach"], ", ") + ", none of which is in its ceiling; those calls will be refused"
+            let eff be core.effective_ceiling(core.substitute(l["manifest"]["caps"], ".", l["dir"]), ".")
+            each t in opt(l["manifest"], "tools", [])
+                set tools to append(tools, {
+                    "name": "lamp_" + l["name"] + "_" + t["name"],
+                    "description": core.text_or(opt(t, "description", ""), "") + "  [lamp: " + l["name"] + " · ceiling: " + eff + warn + "]",
+                    "inputSchema": opt(t, "parameters", {"type": "object", "properties": {}})})
+    give tools
+
+task rows_for_list()
+    let ses be core.session_conf()
+    let ses_ceiling be nothing
+    when ses != nothing
+        set ses_ceiling to opt(ses, "ceiling", nothing)
+    let rows be []
+    each l in core.discover()
+        when contains(l, "broken")
+            set rows to append(rows, {"name": l["name"], "origin": l["origin"], "broken": l["broken"]})
+        otherwise
+            let li be core.lint(l["manifest"]["caps"], l["source"])
+            set rows to append(rows, {
+                "name": l["name"], "origin": l["origin"], "enabled": l["enabled"],
+                "ceiling": l["manifest"]["caps"],
+                "effective_ceiling": core.effective_ceiling(core.substitute(l["manifest"]["caps"], ".", l["dir"]), "."),
+                "profile": opt(l["manifest"], "profile", "pure"),
+                "tools": apply((t) => t["name"], opt(l["manifest"], "tools", [])),
+                "keeps_promise": li["keeps_promise"],
+                "asks_above_ceiling": li["overreach"],
+                "careless_ceiling": li["sloppy"]})
+    give json_encode({"session_ceiling": ses_ceiling, "lamps": rows})
+
+task refusal_text(r)
+    let lines be apply((a) => "DENIED " + a["capability"] + ": " + core.text_or(opt(a, "reason", nothing), "not granted"), r["denied"])
+    each e in r["errors"]
+        set lines to append(lines, e)
+    when r["timed_out"]
+        set lines to append(lines, "timed out")
+    when length(lines) == 0
+        give "the run failed"
+    give join(lines, "\n")
+
+task dispatch(name, a)
+    when name == "lamps_list"
+        give rows_for_list()
+    when name == "lamps_audit"
+        give json_encode(core.audit_tail(200))
+    when name == "lamps_eval"
+        let ses be core.session_conf()
+        when ses == nothing or not opt(ses, "eval", false)
+            raise("ad-hoc execution is off: no session ceiling with \"eval\": true")
+        let source be core.text_or(opt(a, "source", ""), "")
+        let r be core.run_eval(source, opt(ses, "timeout", 60))
+        core.audit_append({"eval": true, "source": source, "ok": r["ok"], "ceiling": r["ceiling"],
+                           "granted": core.caps_of(r["granted"]), "denied": core.caps_of(r["denied"])})
+        when not r["ok"]
+            raise(refusal_text(r))
+        give join(r["output"], "\n")
+    when not starts_with(name, "lamp_")
+        raise("unknown tool " + name)
+    -- Resolve against real lamp names rather than splitting on "_": lamp names may
+    -- contain underscores, tool names too.
+    each l in core.discover()
+        when not contains(l, "broken")
+            each t in opt(l["manifest"], "tools", [])
+                when name == "lamp_" + l["name"] + "_" + t["name"]
+                    when not opt(l, "enabled", false)
+                        raise("lamp " + l["name"] + " is not enabled (lamp enable " + l["name"] + ")")
+                    let r be core.call_tool(l, t["name"], a, {"root": ".", "conf": opt(l, "conf", nothing)})
+                    core.audit_append({"lamp": l["name"], "tool": t["name"], "ok": r["ok"],
+                                       "ceiling": r["ceiling"],
+                                       "granted": core.caps_of(r["granted"]),
+                                       "denied": core.caps_of(r["denied"])})
+                    when not r["ok"]
+                        raise(refusal_text(r))
+                    give core.text_or(r["result"], "")
+    raise("unknown tool " + name)
+
+task handle_line(line, version)
+    let req be nothing
+    try
+        set req to json_decode(line)
+    recover err
+        give nothing
+    when type_of(req) != "map"
+        give nothing
+    let method be core.text_or(opt(req, "method", ""), "")
+    let has_id be contains(req, "id")
+    when method == "initialize"
+        when has_id
+            reply(req["id"], {"protocolVersion": "2024-11-05",
+                              "capabilities": {"tools": {}},
+                              "serverInfo": {"name": "lamp", "version": version}})
+    otherwise when method == "notifications/initialized"
+        give nothing
+    otherwise when method == "tools/list"
+        when has_id
+            reply(req["id"], {"tools": catalog()})
+    otherwise when method == "tools/call"
+        when has_id
+            let params be opt(req, "params", {})
+            try
+                let out be dispatch(core.text_or(opt(params, "name", ""), ""), opt(params, "arguments", {}))
+                reply(req["id"], {"content": [{"type": "text", "text": out}], "isError": false})
+            recover err
+                fail(req["id"], err)
+    otherwise
+        when has_id
+            print(json_encode({"jsonrpc": "2.0", "id": req["id"],
+                               "error": {"code": 0 - 32601, "message": "unknown method " + method}}))
+            flush()
+    give nothing
+
+export task serve_stdio(version)
+    while true
+        let line be read_line()
+        when line == nothing
+            stop
+        when trim(line) != ""
+            handle_line(line, version)

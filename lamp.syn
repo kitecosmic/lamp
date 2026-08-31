@@ -1,0 +1,351 @@
+-- lamp — capacidades con techo, para humanos y agentes.
+--
+-- A lamp is a distributable unit of capability: the same thing a human runs from
+-- the terminal and an agent receives as a tool, with a permission ceiling declared
+-- in its manifest and enforced by the runtime — not by trust.
+--
+-- This file is the whole CLI. It runs lamps with run_program: a child process of
+-- this same binary, under manifest ∩ project ∩ session, with every capability
+-- check coming back as data. The broad `require` lines below are the other half of
+-- that design: run_program can only LEND what this program holds, so the runner
+-- holds the families and every lamp gets the intersection with its own manifest.
+--
+--   lamp pull shell            bring a lamp        lamp run git log '{"n": 5}'
+--   lamp list                  what's here         lamp mcp
+--   lamp inspect evil-thing    what does it ask?   lamp eval 'print(1 + 1)'
+--
+-- Build the binary:  synsema build lamp.syn -o lamp
+intent: "run lamps — distributable units of capability — under their declared ceilings"
+
+require stdin
+require env
+require time
+require file
+require net
+require exec
+require db
+require llm
+require sandbox_run
+
+use "./core.syn" as core
+use "./mcp.syn" as mcp
+
+let VERSION be "0.1.0"
+
+task opt(m, k, d)
+    when contains(m, k)
+        give m[k]
+    give d
+
+task usage()
+    print("lamp v" + VERSION + " — capabilities with a ceiling, for humans and agents")
+    print("")
+    print("  lamp pull <ref>            bring a lamp    (shell · owner/repo · owner/repo@tag · github.com/x/y · ./folder)")
+    print("  lamp update <ref>          pull the latest tag; unchanged hashes = nothing to do")
+    print("  lamp list                  every lamp here, with its ceiling and its promise")
+    print("  lamp inspect <lamp>        what it asks, what it promises, whether it breaks the promise")
+    print("  lamp run <lamp> <tool> ['{\"json\": \"args\"}']    run one tool under the ceiling")
+    print("  lamp <lamp> <tool> [json]  shortcut for run")
+    print("  lamp enable <name>         offer a pulled lamp to agents (the human act)")
+    print("  lamp disable <name>        stop offering it")
+    print("  lamp mcp                   MCP server over stdio for any agent harness")
+    print("  lamp eval '<syn>'          ad-hoc code under the session ceiling (~/.lamps/session.json)")
+    print("  lamp audit                 what was asked, granted, denied")
+    print("  lamp init                  write ./.lamps/config.json (the project ceiling)")
+    print("  lamp skill                 write the agent skill (.agents/skills/lamps/SKILL.md)")
+    print("  lamp search [q]            search the hub index")
+    print("  lamp version | upgrade | help")
+    print("")
+    print("A refusal is the system working: the lamp asked, the answer was no, and it is on the record.")
+
+task pad(s, n)
+    let out be s
+    while length(out) < n
+        set out to out + " "
+    give out
+
+task clip(s, n)
+    when length(s) > n
+        give slice(s, 0, n - 1) + "…"
+    give s
+
+task print_lint(li)
+    when not li["keeps_promise"]
+        print("BREAKS ITS PROMISE — asks for " + text(length(li["overreach"])) + " thing(s) it never declared:")
+        each o in li["overreach"]
+            print("  ! " + o)
+    each s in li["sloppy"]
+        print("  ~ careless ceiling: " + s)
+
+-- ── commands ────────────────────────────────────────────────────────────────
+
+task cmd_list()
+    let rows be core.discover()
+    when length(rows) == 0
+        print("no lamps yet — lamp pull shell")
+        give nothing
+    print(pad("NAME", 22) + pad("ORIGIN", 12) + pad("ON", 4) + pad("PROFILE", 9) + pad("PROMISE", 9) + "CEILING")
+    each l in rows
+        when contains(l, "broken")
+            print(pad(l["name"], 22) + pad(l["origin"], 12) + pad("-", 4) + pad("-", 9) + pad("BROKEN", 9) + l["broken"])
+        otherwise
+            let li be core.lint(l["manifest"]["caps"], l["source"])
+            let promise be "ok"
+            when not li["keeps_promise"]
+                set promise to "BREAKS"
+            let on be "no"
+            when l["enabled"]
+                set on to "yes"
+            print(pad(l["name"], 22) + pad(l["origin"], 12) + pad(on, 4) +
+                  pad(opt(l["manifest"], "profile", "pure"), 9) + pad(promise, 9) +
+                  clip(l["manifest"]["caps"], 100))
+
+task resolve_or_die(name)
+    let loc be core.locate(name)
+    when loc == nothing
+        raise("no lamp '" + name + "' — lamp list, or lamp pull <ref>")
+    give loc
+
+task cmd_inspect(name)
+    let loc be resolve_or_die(name)
+    let l be core.load_lamp(loc["dir"])
+    let m be l["manifest"]
+    print(m["name"] + " v" + core.text_or(opt(m, "version", "?"), "?") + "  [" + opt(m, "profile", "pure") + "]  " + l["dir"])
+    print(core.text_or(opt(m, "description", ""), ""))
+    print("")
+    print("ceiling:   " + m["caps"])
+    let eff be core.effective_ceiling(core.substitute(m["caps"], ".", l["dir"]), ".")
+    when eff != m["caps"]
+        print("effective: " + eff + "   (after project/session ceilings)")
+    print("")
+    let li be core.lint(m["caps"], l["source"])
+    when li["keeps_promise"] and length(li["sloppy"]) == 0
+        print("keeps its promise: every require of the source is inside the manifest's ceiling")
+    print_lint(li)
+    print("")
+    print("tools:")
+    each t in opt(m, "tools", [])
+        print("  " + pad(t["name"], 12) + clip(core.text_or(opt(t, "description", ""), ""), 90))
+    when file_exists(loc["dir"] + "/.pulled")
+        let p be json_decode(read_file(loc["dir"] + "/.pulled"))
+        print("")
+        print("pulled:    " + core.text_or(opt(p, "ref", "?"), "?") + " @ " + core.text_or(opt(p, "tag", "?"), "?") + "  (" + core.text_or(opt(p, "at", "?"), "?") + ")")
+
+task cmd_pull(ref, updating)
+    let r be core.pull(ref)
+    when not r["changed"]
+        print(r["name"] + " @ " + r["tag"] + " — already up to date")
+        give nothing
+    let verb be "pulled"
+    when updating
+        set verb to "updated"
+    print(verb + " " + r["name"] + " @ " + r["tag"] + " → " + r["dir"])
+    each f in keys(r["files"])
+        print("  " + pad(f, 14) + "sha256 " + slice(r["files"][f], 0, 12) + "…")
+    print_lint(r["lint"])
+    when r["lint"]["keeps_promise"]
+        print("keeps its promise · run it:  lamp run " + r["name"] + " <tool>  · offer it:  lamp enable " + r["name"])
+
+task cmd_enable(name, on)
+    let g be core.locate_global(name)
+    when g == nothing
+        when core.locate(name) != nothing
+            raise("'" + name + "' is a project lamp — committing it to ./.lamps IS enabling it")
+        raise("no pulled lamp '" + name + "' — lamp pull <ref> first")
+    let l be core.load_lamp(g)
+    let listed be core.enabled_list()
+    when on
+        let li be core.lint(l["manifest"]["caps"], l["source"])
+        print_lint(li)
+        when not contains(listed, name)
+            set listed to append(listed, name)
+        write_file(core.lamps_home() + "/enabled.json", json_encode(listed))
+        print("enabled " + name + " — agents now get its tools via lamp mcp")
+    otherwise
+        write_file(core.lamps_home() + "/enabled.json", json_encode(where(listed, (x) => x != name)))
+        print("disabled " + name)
+
+task cmd_run(rest)
+    when length(rest) < 2
+        raise("usage: lamp run <lamp> <tool> ['{\"json\": \"args\"}']")
+    let name be rest[0]
+    let tool be rest[1]
+    let loc be resolve_or_die(name)
+    let l be core.load_lamp(loc["dir"])
+    let a be {}
+    when length(rest) > 2
+        set a to json_decode(rest[2])
+    let timeout be floor(number(env("LAMP_TIMEOUT", "120")))
+    let r be core.call_tool(l, tool, a, {"root": ".", "conf": loc["conf"], "timeout": timeout})
+    core.audit_append({"lamp": l["name"], "tool": tool, "ok": r["ok"], "ceiling": r["ceiling"],
+                       "granted": core.caps_of(r["granted"]), "denied": core.caps_of(r["denied"])})
+    when r["ok"]
+        each line in r["output"]
+            print(line)
+    otherwise
+        print(json_encode(core.refusal(r)))
+
+task cmd_eval(source)
+    let r be core.run_eval(source, floor(number(env("LAMP_TIMEOUT", "60"))))
+    core.audit_append({"eval": true, "source": source, "ok": r["ok"], "ceiling": r["ceiling"],
+                       "granted": core.caps_of(r["granted"]), "denied": core.caps_of(r["denied"])})
+    when r["ok"]
+        each line in r["output"]
+            print(line)
+    otherwise
+        print(json_encode(core.refusal(r)))
+
+task cmd_audit()
+    let rows be core.audit_tail(50)
+    when length(rows) == 0
+        print("no audit yet — every lamp run, eval and MCP call lands in " + core.lamps_home() + "/audit/log.jsonl")
+        give nothing
+    each row in rows
+        print(json_encode(row))
+
+task cmd_init()
+    when file_exists("./.lamps/config.json")
+        print("./.lamps/config.json already exists — it is the project ceiling; edit it there")
+        give nothing
+    write_file("./.lamps/config.json", json_encode({
+        "caps": "stdout,env=LAMP_*,file.read={root}/*,net=*,exec=git,db={root}/*"}))
+    print("wrote ./.lamps/config.json — the project ceiling: every lamp runs under its manifest ∩ this ∩ the session")
+    print("tighten it: drop families you never want here (net=*, db=…), commit it, and it goes through code review")
+
+task cmd_skill()
+    let dest be "./.agents/skills/lamps/SKILL.md"
+    let lines be [
+        "---",
+        "name: lamps",
+        "description: Use lamps — capability-ceilinged tools — instead of raw shell for git, sql, http and project commands. `lamp list` shows what is installed; every call runs under a declared ceiling and is audited.",
+        "---",
+        "",
+        "# lamps",
+        "",
+        "A lamp is a tool with a permission ceiling declared in its manifest and enforced by",
+        "the runtime. Prefer a lamp over a raw shell command when one covers the need: the",
+        "grant is over effects (net, file, db, exec), the credential never reaches you, and",
+        "every refusal comes back as data.",
+        "",
+        "- `lamp list` — every lamp here, its ceiling, whether it keeps its promise",
+        "- `lamp inspect <lamp>` — what it asks before you run it",
+        "- `lamp run <lamp> <tool> '{\"json\": \"args\"}'` — one call under the ceiling",
+        "- `lamp audit` — what was asked, granted, denied",
+        "",
+        "A `DENIED capability(...)` answer is the system working: do not retry with a wider",
+        "ceiling — tell the human what was refused and why you needed it.",
+        ""]
+    write_file(dest, join(lines, "\n"))
+    print("wrote " + dest)
+
+task cmd_search(q)
+    let hub be env("LAMP_HUB", "https://hub.lamps.dev")
+    let r be http_get(hub + "/api/index.json", {"User-Agent": "lamp"})
+    when not r["ok"]
+        raise("the hub at " + hub + " is not reachable (status " + text(r["status"]) + ") — lamps also live in plain repos: lamp pull owner/repo")
+    let idx be core.body_json(r)
+    when idx == nothing
+        raise("the hub answered but its index is not JSON — try again later")
+    let items be opt(idx, "lamps", idx)
+    let shown be 0
+    each it in items
+        let hay be fold(core.text_or(opt(it, "name", ""), "") + " " + core.text_or(opt(it, "description", ""), ""))
+        when q == "" or contains(hay, fold(q))
+            print(pad(core.text_or(opt(it, "ref", opt(it, "name", "?")), "?"), 26) + clip(core.text_or(opt(it, "description", ""), ""), 80))
+            set shown to shown + 1
+    when shown == 0
+        print("nothing matches '" + q + "'")
+
+task cmd_upgrade()
+    let r be http_get("https://api.github.com/repos/kitecosmic/lamp/releases/latest", {"User-Agent": "lamp"})
+    when not r["ok"]
+        raise("cannot reach github.com to check the latest release (status " + text(r["status"]) + ")")
+    let rel be core.body_json(r)
+    when rel == nothing
+        raise("github answered but not with JSON — try again later")
+    let latest be core.text_or(opt(rel, "tag_name", ""), "")
+    when latest == "v" + VERSION or latest == VERSION
+        print("lamp v" + VERSION + " is the latest")
+        give nothing
+    print("new version: " + latest + " (you have v" + VERSION + ")")
+    print("re-run the installer — it downloads, verifies the sha256 and swaps the binary:")
+    print("  curl -fsSL https://lamps.dev/install | sh          # mac / linux")
+    print("  irm https://lamps.dev/install.ps1 | iex            # windows")
+
+-- ── dispatch ────────────────────────────────────────────────────────────────
+
+let COMMANDS be ["help", "--help", "-h", "version", "--version", "list", "inspect",
+                 "pull", "update", "run", "enable", "disable", "mcp", "eval", "audit",
+                 "init", "skill", "search", "publish", "upgrade"]
+
+task need(argv, i, msg)
+    when length(argv) <= i
+        raise("usage: " + msg)
+    give argv[i]
+
+task main()
+    let argv be args()
+    when length(argv) == 0
+        usage()
+        give nothing
+    let cmd be argv[0]
+    when cmd == "help" or cmd == "--help" or cmd == "-h"
+        usage()
+    otherwise when cmd == "version" or cmd == "--version"
+        print("lamp v" + VERSION)
+    otherwise when cmd == "list"
+        cmd_list()
+    otherwise when cmd == "inspect"
+        cmd_inspect(need(argv, 1, "lamp inspect <lamp>"))
+    otherwise when cmd == "pull"
+        cmd_pull(need(argv, 1, "lamp pull <ref>"), false)
+    otherwise when cmd == "update"
+        cmd_pull(need(argv, 1, "lamp update <ref>"), true)
+    otherwise when cmd == "run"
+        cmd_run(slice(argv, 1, length(argv)))
+    otherwise when cmd == "enable"
+        cmd_enable(need(argv, 1, "lamp enable <name>"), true)
+    otherwise when cmd == "disable"
+        cmd_enable(need(argv, 1, "lamp disable <name>"), false)
+    otherwise when cmd == "mcp"
+        when length(argv) > 1 and argv[1] == "--http"
+            raise("lamp mcp serves stdio (what agent harnesses use); HTTP transport arrives with a serve-capable build")
+        mcp.serve_stdio(VERSION)
+    otherwise when cmd == "eval"
+        cmd_eval(need(argv, 1, "lamp eval '<synsema source>'"))
+    otherwise when cmd == "audit"
+        cmd_audit()
+    otherwise when cmd == "init"
+        cmd_init()
+    otherwise when cmd == "skill"
+        cmd_skill()
+    otherwise when cmd == "search"
+        let q be ""
+        when length(argv) > 1
+            set q to argv[1]
+        cmd_search(q)
+    otherwise when cmd == "publish"
+        print("publish: the hub is not open yet — publishing IS pushing the lamp's folder to a public repo (then: lamp pull owner/repo)")
+    otherwise when cmd == "upgrade"
+        cmd_upgrade()
+    otherwise when length(argv) >= 2 and core.locate(cmd) != nothing
+        cmd_run(argv)
+    otherwise
+        raise("unknown command '" + cmd + "' — lamp help")
+
+main()
+
+-- ── tests ───────────────────────────────────────────────────────────────────
+
+test "pad and clip shape the table"
+    assert_eq(pad("ab", 4), "ab  ")
+    assert_eq(clip("abcdef", 4), "abc…")
+    assert_eq(clip("ab", 4), "ab")
+
+test "need refuses a missing argument with the usage line"
+    assert_eq(need(["run", "git"], 1, "x"), "git")
+    assert_error(() => need(["run"], 1, "lamp run <lamp> <tool>"))
+
+test "every command the help names is dispatched"
+    each c in ["pull", "update", "list", "inspect", "run", "enable", "disable", "mcp", "eval", "audit", "init", "skill", "search", "version", "upgrade"]
+        assert(contains(COMMANDS, c))

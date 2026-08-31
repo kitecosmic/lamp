@@ -1,0 +1,613 @@
+-- core — everything the lamp CLI knows how to do, minus the terminal and MCP glue.
+--
+-- A lamp is a folder: lamp.json (the manifest: name, caps, profile, files, tools)
+-- and lamp.syn (the program). The manifest's caps is the ceiling; the runtime
+-- enforces it; this file's job is to compose ceilings (manifest ∩ project ∩ session),
+-- lint promises (does the source ask for more than the manifest declares?), fetch
+-- lamps from a git host file by file with a sha256 per file, and run one tool of one
+-- lamp with run_program — in a child process, under the intersected ceiling, with the
+-- audit coming back as a value.
+
+-- ── tiny helpers ────────────────────────────────────────────────────────────
+
+export task opt(m, k, d)
+    when contains(m, k)
+        give m[k]
+    give d
+
+export task text_or(v, d)
+    when v == nothing
+        give d
+    give text(v)
+
+task fwd(p)
+    give replace_text(p, "\\", "/")
+
+export task home_dir()
+    give fwd(env("USERPROFILE", env("HOME", ".")))
+
+export task lamps_home()
+    give fwd(env("LAMP_HOME", home_dir() + "/.lamps"))
+
+export task substitute(s, root, dir)
+    give replace_text(replace_text(s, "{root}", root), "{dir}", dir)
+
+-- ── ceilings ────────────────────────────────────────────────────────────────
+-- "stdout,env=LAMP_*,net=a,net=b" becomes {"order": [...], "fams": {family: [patterns]}}
+
+export task parse_ceiling(caps)
+    let order be []
+    let fams be {}
+    each token in split(text_or(caps, ""), ",")
+        let t be trim(token)
+        when t != ""
+            let eq be split(t, "=")
+            let family be trim(eq[0])
+            when not contains(fams, family)
+                set order to append(order, family)
+                set fams[family] to []
+            when length(eq) > 1
+                set fams[family] to append(fams[family], trim(join(slice(eq, 1, length(eq)), "=")))
+    give {"order": order, "fams": fams}
+
+task glob_to_re(p)
+    let out be ""
+    each i in range(length(p))
+        let c be slice(p, i, i + 1)
+        when c == "*"
+            set out to out + ".*"
+        otherwise when contains(".^$|()[]{}+?\\", c)
+            set out to out + "\\" + c
+        otherwise
+            set out to out + c
+    give out
+
+export task covers(pattern, value)
+    give matches(value, glob_to_re(pattern))
+
+-- Conservative: keep a pattern only if one side demonstrably covers the other.
+task intersect_patterns(a, b)
+    when length(a) == 0
+        give b
+    when length(b) == 0
+        give a
+    let kept be []
+    each p in a
+        each q in b
+            when covers(p, q) and not contains(kept, q)
+                set kept to append(kept, q)
+            otherwise when covers(q, p) and not contains(kept, p)
+                set kept to append(kept, p)
+    give kept
+
+-- A lamp's ceiling is not the last word: the project has one (.lamps/config.json)
+-- and the session has one (~/.lamps/session.json). What runs is the intersection —
+-- a lamp can only ever narrow it.
+export task intersect(a, b)
+    when a == nothing or a == ""
+        give text_or(b, "")
+    when b == nothing or b == ""
+        give a
+    let pa be parse_ceiling(a)
+    let pb be parse_ceiling(b)
+    let out be []
+    each family in pa["order"]
+        when contains(pb["fams"], family)
+            let kept be intersect_patterns(pa["fams"][family], pb["fams"][family])
+            when length(pa["fams"][family]) == 0 and length(pb["fams"][family]) == 0
+                set out to append(out, family)
+            otherwise when length(kept) > 0
+                each p in kept
+                    set out to append(out, family + "=" + p)
+    give join(out, ",")
+
+-- ── the promise linter ──────────────────────────────────────────────────────
+-- The interpreter refuses anything above the ceiling — but a refusal at call time is
+-- late. This is the same comparison done on the text, before enabling. It is a lint,
+-- not a proof: it compares capability FAMILIES and leaves pattern matching to the
+-- interpreter, which is the thing that actually decides.
+
+export task parse_requires(source)
+    let reqs be []
+    each line in split(source, "\n")
+        let t be trim(line)
+        when starts_with(t, "require ") or t == "require"
+            let fam be capture(t, "require\\s+([a-z_][a-z0-9_.]*)")
+            when fam != nothing
+                let family be fam[0]
+                let pat be capture(t, "require\\s+[a-z_][a-z0-9_.]*\\(\\s*\"([^\"]*)\"\\s*\\)")
+                let label be family
+                when pat != nothing
+                    set label to family + "(\"" + pat[0] + "\")"
+                set reqs to append(reqs, {"family": family, "text": label})
+    give reqs
+
+-- The families that reach something, minus the harmless ones (stdout, time, random).
+let REACHING be ["net", "secret", "file", "file.read", "file.write", "exec", "env",
+                 "db", "llm", "serve", "reveal", "sign", "wallet", "spend", "memory",
+                 "stdin", "sandbox_run"]
+
+task sloppy_notes(pc)
+    let notes be []
+    each family in pc["order"]
+        when contains(REACHING, family)
+            let pats be pc["fams"][family]
+            when length(pats) == 0
+                set notes to append(notes, family + " is bare: it grants the whole family")
+            otherwise
+                each p in pats
+                    when p == "*" or p == "/*" or p == "**"
+                        set notes to append(notes, family + "=" + p + " grants the whole family")
+    give notes
+
+export task lint(caps, source)
+    let pc be parse_ceiling(caps)
+    let overreach be []
+    each req in parse_requires(source)
+        let root_family be split(req["family"], ".")[0]
+        when not contains(pc["fams"], req["family"]) and not contains(pc["fams"], root_family)
+            set overreach to append(overreach, req["text"])
+    give {"overreach": overreach, "sloppy": sloppy_notes(pc),
+          "keeps_promise": length(overreach) == 0}
+
+-- ── loading and validating ──────────────────────────────────────────────────
+-- The original rule was "exec is never allowed" — the right fear aimed at the wrong
+-- word: the hole was unbounded execution, not execution. exec=git names one binary
+-- and the interpreter enforces it. exec bare and exec=* are still the hole.
+
+export task validate_manifest(m)
+    let name be opt(m, "name", "?")
+    when not contains(m, "caps") or trim(text_or(m["caps"], "")) == ""
+        raise(name + ": manifest declares no caps")
+    let pc be parse_ceiling(m["caps"])
+    when contains(pc["fams"], "exec")
+        let pats be pc["fams"]["exec"]
+        when length(pats) == 0 or contains(pats, "*")
+            raise(name + ": an unbounded 'exec' ceiling is never allowed — name the binaries (exec=git)")
+        when opt(m, "profile", "pure") != "native"
+            raise(name + ": 'exec' needs profile \"native\" — the pure profile has no processes")
+    give true
+
+export task load_lamp(dir)
+    let d be fwd(dir)
+    when not file_exists(d + "/lamp.json")
+        raise("no lamp.json in " + d)
+    let m be json_decode(read_file(d + "/lamp.json"))
+    validate_manifest(m)
+    let entry be opt(m, "entry", "lamp.syn")
+    when not file_exists(d + "/" + entry)
+        raise(d + " has no " + entry)
+    give {"dir": d, "manifest": m, "source": read_file(d + "/" + entry), "name": m["name"]}
+
+-- ── the store ───────────────────────────────────────────────────────────────
+--   ~/.lamps/lamps/<owner>/<name>/   pulled lamps        (lamp.json, files, .pulled)
+--   ~/.lamps/enabled.json            the human act
+--   ~/.lamps/session.json            the ceiling for everything
+--   ./.lamps/<name>/                 the project's own lamps (committed = enabled)
+--   ./.lamps/config.json             the project ceiling
+
+export task enabled_list()
+    let p be lamps_home() + "/enabled.json"
+    when not file_exists(p)
+        give []
+    try
+        let v be json_decode(read_file(p))
+        when type_of(v) == "list"
+            give v
+        give []
+    recover err
+        give []
+
+export task session_conf()
+    let p be lamps_home() + "/session.json"
+    when not file_exists(p)
+        give nothing
+    try
+        give json_decode(read_file(p))
+    recover err
+        give nothing
+
+export task project_conf()
+    when not file_exists("./.lamps/config.json")
+        give nothing
+    try
+        give json_decode(read_file("./.lamps/config.json"))
+    recover err
+        give nothing
+
+export task effective_ceiling(caps, root)
+    let c be caps
+    let pc be project_conf()
+    when pc != nothing and trim(text_or(opt(pc, "caps", ""), "")) != ""
+        set c to intersect(c, substitute(pc["caps"], root, ""))
+    let s be session_conf()
+    when s != nothing and trim(text_or(opt(s, "ceiling", ""), "")) != ""
+        set c to intersect(c, substitute(s["ceiling"], root, ""))
+    give c
+
+export task locate_global(name)
+    let base be lamps_home() + "/lamps"
+    when contains(name, "/")
+        let d be base + "/" + name
+        when file_exists(d + "/lamp.json")
+            give d
+        give nothing
+    when not file_exists(base)
+        give nothing
+    let hits be []
+    each o in list_dir(base)
+        when o["is_dir"]
+            let d be base + "/" + o["name"] + "/" + name
+            when file_exists(d + "/lamp.json")
+                set hits to append(hits, d)
+    when length(hits) == 1
+        give hits[0]
+    when length(hits) > 1
+        raise("ambiguous lamp '" + name + "' — use owner/name (" + text(length(hits)) + " matches)")
+    give nothing
+
+-- "git" resolves to project ./.lamps/git first, then any owner in ~/.lamps/lamps; a
+-- value starting with ./ or ../ or an absolute path is taken as a folder, literally.
+export task locate(name)
+    when starts_with(name, "./") or starts_with(name, "../") or starts_with(name, "/") or contains(name, ":/")
+        when file_exists(name + "/lamp.json")
+            give {"dir": name, "conf": nothing}
+        give nothing
+    when not contains(name, "/") and file_exists("./.lamps/" + name + "/lamp.json")
+        give {"dir": "./.lamps/" + name, "conf": nothing}
+    let g be locate_global(name)
+    when g == nothing
+        give nothing
+    let short be name
+    when contains(name, "/")
+        let segs be split(name, "/")
+        set short to segs[length(segs) - 1]
+    let confdir be "./.lamps/" + short
+    when file_exists(confdir) and not file_exists(confdir + "/lamp.json")
+        give {"dir": g, "conf": confdir}
+    give {"dir": g, "conf": nothing}
+
+-- Every lamp this machine knows: the project's (committed = enabled) and the pulled
+-- globals (enabled by ~/.lamps/enabled.json). Project wins on a name collision.
+export task discover()
+    let out be []
+    let seen be []
+    when file_exists("./.lamps")
+        each e in list_dir("./.lamps")
+            when e["is_dir"] and file_exists("./.lamps/" + e["name"] + "/lamp.json")
+                try
+                    let l be load_lamp("./.lamps/" + e["name"])
+                    set l["origin"] to "project"
+                    set l["enabled"] to true
+                    set l["conf"] to nothing
+                    set out to append(out, l)
+                    set seen to append(seen, l["name"])
+                recover err
+                    set out to append(out, {"name": e["name"], "origin": "project", "broken": err})
+    let base be lamps_home() + "/lamps"
+    when file_exists(base)
+        let on be enabled_list()
+        each o in list_dir(base)
+            when o["is_dir"]
+                each e in list_dir(base + "/" + o["name"])
+                    when e["is_dir"] and file_exists(base + "/" + o["name"] + "/" + e["name"] + "/lamp.json") and not contains(seen, e["name"])
+                        try
+                            let l be load_lamp(base + "/" + o["name"] + "/" + e["name"])
+                            set l["origin"] to o["name"]
+                            set l["enabled"] to contains(on, l["name"]) or contains(on, o["name"] + "/" + l["name"])
+                            set l["conf"] to nothing
+                            let confdir be "./.lamps/" + l["name"]
+                            when file_exists(confdir) and not file_exists(confdir + "/lamp.json")
+                                set l["conf"] to confdir
+                            set out to append(out, l)
+                            set seen to append(seen, l["name"])
+                        recover err
+                            set out to append(out, {"name": e["name"], "origin": o["name"], "broken": err})
+    give out
+
+-- ── running ─────────────────────────────────────────────────────────────────
+-- One gate for both cases: a packaged lamp and a snippet written a second ago run
+-- through run_program — a child process of this same binary, under the intersected
+-- ceiling, with every capability check coming back as data in the audit.
+
+task wrap_run(r, ceiling, prof)
+    let denied be where(r["audit"], (a) => not a["granted"] and a["origin"] == "program")
+    let granted be where(r["audit"], (a) => a["granted"] and a["origin"] == "program")
+    let out be r["output"]
+    let last be nothing
+    when length(out) > 0
+        set last to out[length(out) - 1]
+    give {"ok": r["ok"] and length(denied) == 0, "result": last, "output": out,
+          "errors": r["errors"], "denied": denied, "granted": granted,
+          "ceiling": ceiling, "profile": prof,
+          "exit": opt(r, "exit", nothing), "timed_out": opt(r, "timed_out", false)}
+
+export task caps_of(entries)
+    give apply((a) => a["capability"], entries)
+
+export task refusal(r)
+    give {"ok": false, "ceiling": r["ceiling"],
+          "denied": apply((a) => "DENIED " + a["capability"] + ": " + text_or(opt(a, "reason", nothing), "not granted"), r["denied"]),
+          "errors": r["errors"], "output": r["output"], "timed_out": r["timed_out"]}
+
+-- The child is a real process: what it inherits is what it gets. Hand it the
+-- minimum, plus the base OS env its own subprocesses need to launch at all.
+task child_env(extra)
+    let e be {"PATH": env("PATH", ""), "SYSTEMROOT": env("SYSTEMROOT", ""),
+              "HOME": env("HOME", ""), "USERPROFILE": env("USERPROFILE", "")}
+    each k in keys(extra)
+        set e[k] to extra[k]
+    give e
+
+export task call_tool(l, tool, args_map, opts)
+    let m be l["manifest"]
+    let specs be opt(m, "tools", [])
+    let known be apply((t) => t["name"], specs)
+    when not contains(known, tool)
+        raise("unknown tool '" + tool + "' of " + l["name"] + " (" + join(known, ", ") + ")")
+    let root be fwd(opt(opts, "root", "."))
+    let dir be l["dir"]
+    when opt(opts, "conf", nothing) != nothing
+        set dir to opts["conf"]
+    let caps be substitute(m["caps"], root, dir)
+    let src be substitute(l["source"], root, dir)
+    let ceiling be effective_ceiling(caps, root)
+    let prof be "pure"
+    when opt(m, "profile", "pure") == "native"
+        set prof to "native"
+    let extra be {"LAMP_TOOL": tool, "LAMP_ARGS": json_encode(args_map),
+                  "LAMP_ROOT": root, "LAMP_DIR": dir}
+    each name in opt(m, "env", [])
+        let v be env(name, "")
+        when v != ""
+            set extra[name] to v
+    let r be run_program(src, {"ceiling": ceiling, "profile": prof,
+                               "env": child_env(extra), "timeout": opt(opts, "timeout", 120),
+                               "cwd": root, "filename": l["name"] + "/lamp.syn"})
+    give wrap_run(r, ceiling, prof)
+
+-- Ad-hoc code: no manifest, no install, same gate. Exists only when a human wrote
+-- a session ceiling — with no ~/.lamps/session.json there is no ad-hoc execution.
+export task run_eval(source, timeout)
+    let ses be session_conf()
+    when ses == nothing or trim(text_or(opt(ses, "ceiling", ""), "")) == ""
+        raise("ad-hoc execution is off: no session ceiling (write " + lamps_home() + "/session.json with {\"ceiling\": \"...\", \"eval\": true})")
+    let root be "."
+    let ceiling be substitute(ses["ceiling"], root, "")
+    let prof be "pure"
+    when opt(ses, "native", false)
+        set prof to "native"
+    let r be run_program(source, {"ceiling": ceiling, "profile": prof,
+                               "env": child_env({}), "timeout": timeout,
+                               "cwd": root, "filename": "eval.syn"})
+    give wrap_run(r, ceiling, prof)
+
+-- ── the audit ───────────────────────────────────────────────────────────────
+-- What was asked, what was granted, what was denied — one JSON line per call,
+-- appended, never rewritten.
+
+export task audit_append(row)
+    set row["at"] to format_time(now())
+    append_file(lamps_home() + "/audit/log.jsonl", json_encode(row) + "\n")
+
+export task audit_tail(n)
+    let p be lamps_home() + "/audit/log.jsonl"
+    when not file_exists(p)
+        give []
+    let lines be where(split(read_file(p), "\n"), (l) => trim(l) != "")
+    let rows be []
+    each l in slice(lines, 0 - min(n, length(lines)), length(lines))
+        try
+            set rows to append(rows, json_decode(l))
+        recover err
+            set rows to append(rows, {"raw": l})
+    give rows
+
+-- ── pull: no git, no tar ────────────────────────────────────────────────────
+-- lamp.json lists its files; pull downloads them one by one from
+-- raw.githubusercontent.com, hashes each with sha256, and records .pulled
+-- (ref + tag + hashes). Pure net + file; zero exec. update = pull of the
+-- latest tag; unchanged hashes = nothing to do.
+
+export task parse_ref(ref)
+    let r be ref
+    let tag be ""
+    when contains(r, "@")
+        let at be split(r, "@")
+        set r to at[0]
+        set tag to at[1]
+    when starts_with(r, "./") or starts_with(r, "../") or starts_with(r, "/") or contains(r, ":/")
+        give {"local": true, "dir": r, "tag": "local"}
+    set r to replace_text(replace_text(r, "https://github.com/", ""), "github.com/", "")
+    let segs be where(split(r, "/"), (s) => s != "")
+    when length(segs) == 0
+        raise("empty ref")
+    when length(segs) == 1
+        give {"local": false, "owner": "kitecosmic", "repo": "lamps",
+              "path": "lamps/" + segs[0] + "/", "name": segs[0], "tag": tag}
+    when length(segs) == 2
+        give {"local": false, "owner": segs[0], "repo": segs[1],
+              "path": "", "name": segs[1], "tag": tag}
+    give {"local": false, "owner": segs[0], "repo": segs[1],
+          "path": join(slice(segs, 2, length(segs)), "/") + "/",
+          "name": segs[length(segs) - 1], "tag": tag}
+
+-- The response map carries a parsed json field only when the body parsed; be
+-- defensive and fall back to parsing the body ourselves.
+export task body_json(r)
+    when contains(r, "json") and r["json"] != nothing
+        give r["json"]
+    try
+        give json_decode(opt(r, "body", ""))
+    recover err
+        give nothing
+
+task latest_tag(owner, repo)
+    let r be http_get("https://api.github.com/repos/" + owner + "/" + repo + "/tags",
+                      {"User-Agent": "lamp"})
+    let tags be body_json(r)
+    when r["ok"] and type_of(tags) == "list" and length(tags) > 0
+        give tags[0]["name"]
+    give "main"
+
+task safe_rel(f)
+    when contains(f, "..") or starts_with(f, "/") or contains(f, ":")
+        raise("manifest file escapes the lamp folder: " + f)
+    give f
+
+task read_pulled(dest)
+    when not file_exists(dest + "/.pulled")
+        give nothing
+    try
+        give json_decode(read_file(dest + "/.pulled"))
+    recover err
+        give nothing
+
+task same_hashes(a, b)
+    when a == nothing or b == nothing
+        give false
+    when length(keys(a)) != length(keys(b))
+        give false
+    each k in keys(a)
+        when not contains(b, k) or b[k] != a[k]
+            give false
+    give true
+
+task finish_pull(ref, dest, m, hashes, tag, prev)
+    write_file(dest + "/.pulled", json_encode({"ref": ref, "tag": tag,
+        "at": format_time(now()), "files": hashes}))
+    let l be load_lamp(dest)
+    give {"name": m["name"], "dir": dest, "tag": tag, "files": hashes,
+          "lint": lint(m["caps"], l["source"]),
+          "changed": not same_hashes(prev, hashes)}
+
+export task pull(ref)
+    let p be parse_ref(ref)
+    when p["local"]
+        give pull_local(ref, p["dir"])
+    let tag be p["tag"]
+    when tag == ""
+        set tag to latest_tag(p["owner"], p["repo"])
+    let base be "https://raw.githubusercontent.com/" + p["owner"] + "/" + p["repo"] + "/" + tag + "/" + p["path"]
+    let mr be http_get(base + "lamp.json", {"User-Agent": "lamp"})
+    when not mr["ok"]
+        raise("cannot fetch " + base + "lamp.json (status " + text(mr["status"]) + ") — does the ref exist? (lamp pull owner/repo[@tag])")
+    let m be json_decode(mr["body"])
+    validate_manifest(m)
+    let dest be lamps_home() + "/lamps/" + p["owner"] + "/" + m["name"]
+    let prev_pulled be read_pulled(dest)
+    let prev be nothing
+    when prev_pulled != nothing
+        set prev to opt(prev_pulled, "files", nothing)
+    let hashes be {}
+    each f0 in ["lamp.json"] + opt(m, "files", ["lamp.syn"])
+        let f be safe_rel(f0)
+        when not contains(hashes, f)
+            let body be mr["body"]
+            when f != "lamp.json"
+                let fr be http_get(base + f, {"User-Agent": "lamp"})
+                when not fr["ok"]
+                    raise("cannot fetch " + base + f + " (status " + text(fr["status"]) + ")")
+                set body to fr["body"]
+            write_file(dest + "/" + f, body)
+            set hashes[f] to decode(sha256(body), "hex")
+    give finish_pull(ref, dest, m, hashes, tag, prev)
+
+task pull_local(ref, dir)
+    let l be load_lamp(dir)
+    let m be l["manifest"]
+    let dest be lamps_home() + "/lamps/local/" + m["name"]
+    let prev_pulled be read_pulled(dest)
+    let prev be nothing
+    when prev_pulled != nothing
+        set prev to opt(prev_pulled, "files", nothing)
+    let hashes be {}
+    each f0 in ["lamp.json"] + opt(m, "files", ["lamp.syn"])
+        let f be safe_rel(f0)
+        when not contains(hashes, f)
+            let body be read_file(fwd(dir) + "/" + f)
+            write_file(dest + "/" + f, body)
+            set hashes[f] to decode(sha256(body), "hex")
+    give finish_pull(ref, dest, m, hashes, "local", prev)
+
+-- ── tests ───────────────────────────────────────────────────────────────────
+
+test "a ceiling parses into families with merged patterns"
+    let pc be parse_ceiling("stdout,env=LAMP_*,exec=git,exec=ls")
+    assert_eq(pc["order"], ["stdout", "env", "exec"])
+    assert_eq(pc["fams"]["exec"], ["git", "ls"])
+    assert_eq(pc["fams"]["stdout"], [])
+
+test "covers is glob semantics, full match"
+    assert(covers("LAMP_*", "LAMP_TOOL"))
+    assert(covers("*", "anything"))
+    assert(not covers("LAMP_*", "OPENAI_KEY"))
+    assert(not covers("api.x", "api.x.evil.com"))
+    assert(covers("./data/*.csv", "./data/a.csv"))
+
+test "a lamp's net=* narrows to what the session granted"
+    let ses be "stdout,env=LAMP_*,net=registry.npmjs.org"
+    assert_eq(intersect("stdout,env=LAMP_*,net=*", ses), "stdout,env=LAMP_*,net=registry.npmjs.org")
+
+test "a host or family the session never granted disappears entirely"
+    let ses be "stdout,env=LAMP_*,net=registry.npmjs.org"
+    assert(not contains(intersect("stdout,net=collector.attacker.example", ses), "net="))
+    assert(not contains(intersect("stdout,secret=*,env=LAMP_*", ses), "secret"))
+
+test "a lamp asking for less than the session keeps its own narrower ceiling"
+    let ses be "stdout,env=LAMP_*,net=registry.npmjs.org"
+    assert_eq(intersect("stdout,env=LAMP_ARGS", ses), "stdout,env=LAMP_ARGS")
+
+test "intersection is order-independent and empty means no restriction"
+    let ses be "stdout,env=LAMP_*,net=registry.npmjs.org"
+    assert_eq(intersect("stdout,net=*", ses), intersect(ses, "stdout,net=*"))
+    assert_eq(intersect("stdout,exec=git", ""), "stdout,exec=git")
+    assert_eq(intersect(nothing, "stdout"), "stdout")
+
+test "the linter sees a source break its manifest's promise"
+    let src be "require env(\"LAMP_*\")\nrequire secret(\"*\")\nrequire net(\"collector.attacker.example\")\nrequire file.read(\"/*\")\nprint(1)"
+    let li be lint("stdout,env=LAMP_*", src)
+    assert_eq(li["keeps_promise"], false)
+    assert_eq(length(li["overreach"]), 3)
+    assert(contains(li["overreach"], "secret(\"*\")"))
+    assert(contains(li["overreach"], "file.read(\"/*\")"))
+
+test "file.read is covered by a bare file family, not the reverse"
+    assert(lint("stdout,file", "require file.read(\"./x\")")["keeps_promise"])
+    assert_eq(lint("stdout,file.read=./x", "require file(\"./x\")")["keeps_promise"], false)
+
+test "a careless ceiling is flagged, a scoped one is not"
+    assert(contains(lint("stdout,net=*", "print(1)")["sloppy"], "net=* grants the whole family"))
+    assert_eq(length(lint("stdout,env=LAMP_*,exec=git", "print(1)")["sloppy"]), 0)
+
+test "an unbounded exec ceiling is refused at load, a named one on native loads"
+    assert_error(() => validate_manifest({"name": "x", "caps": "stdout,exec", "profile": "native"}))
+    assert_error(() => validate_manifest({"name": "x", "caps": "stdout,exec=*", "profile": "native"}))
+    assert_error(() => validate_manifest({"name": "x", "caps": "stdout,exec=git"}))
+    assert(validate_manifest({"name": "x", "caps": "stdout,exec=git", "profile": "native"}))
+    assert_error(() => validate_manifest({"name": "x", "caps": ""}))
+
+test "substitute replaces both placeholders everywhere"
+    assert_eq(substitute("file.read={root}/*,x={dir}/p", ".", "./lamps/a"), "file.read=./*,x=./lamps/a/p")
+
+test "refs resolve like docker refs"
+    let official be parse_ref("shell")
+    assert_eq(official["owner"], "kitecosmic")
+    assert_eq(official["repo"], "lamps")
+    assert_eq(official["path"], "lamps/shell/")
+    let repo be parse_ref("kitecosmic/postgres@v1.4.2")
+    assert_eq(repo["owner"], "kitecosmic")
+    assert_eq(repo["tag"], "v1.4.2")
+    assert_eq(repo["path"], "")
+    let host be parse_ref("github.com/x/y")
+    assert_eq(host["owner"], "x")
+    assert_eq(host["repo"], "y")
+    let deep be parse_ref("x/y/lamps/z")
+    assert_eq(deep["path"], "lamps/z/")
+    assert_eq(deep["name"], "z")
+    assert(parse_ref("./mi-lamp")["local"])
+
+test "manifest files cannot escape the lamp folder"
+    assert_error(() => safe_rel("../evil"))
+    assert_error(() => safe_rel("/etc/passwd"))
+    assert_eq(safe_rel("policy.json"), "policy.json")
