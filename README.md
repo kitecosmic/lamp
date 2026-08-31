@@ -88,7 +88,7 @@ installed but not enabled is invisible to the model.
 ```
 git clone https://github.com/kitecosmic/synsema && cd synsema
 cargo install --path engine/crates/synsema-cli          # or grab a release binary
-git clone https://github.com/lamps-dev/lamp && cd lamp
+git clone https://github.com/kitecosmic/lamp && cd lamp
 synsema test core.syn && synsema test lamp.syn          # the self-checks
 synsema build lamp.syn -o lamp                          # one file, done
 ```
