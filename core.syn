@@ -462,6 +462,23 @@ task latest_tag(owner, repo)
         give tags[0]["name"]
     give "main"
 
+-- Identity is the address, github-style: the manifest's name must equal the repo
+-- name (one lamp per repo) or the folder name (a monorepo). A name the json merely
+-- declares is spoofable; a name that IS where it lives is guaranteed by the host.
+export task expected_name(ref_parts)
+    when ref_parts["local"]
+        let segs be where(split(replace_text(ref_parts["dir"], "\\", "/"), "/"), (x) => x != "" and x != ".")
+        give segs[length(segs) - 1]
+    when ref_parts["path"] == ""
+        give ref_parts["repo"]
+    let segs be where(split(ref_parts["path"], "/"), (x) => x != "")
+    give segs[length(segs) - 1]
+
+task check_name(m, expected)
+    when m["name"] != expected
+        raise(m["name"] + ": the manifest's name must match where it lives — rename the repo/folder or the manifest (expected \"" + expected + "\")")
+    give true
+
 task safe_rel(f)
     when contains(f, "..") or starts_with(f, "/") or contains(f, ":")
         raise("manifest file escapes the lamp folder: " + f)
@@ -506,6 +523,7 @@ export task pull(ref)
         raise("cannot fetch " + base + "lamp.json (status " + text(mr["status"]) + ") — does the ref exist? (lamp pull owner/repo[@tag])")
     let m be json_decode(mr["body"])
     validate_manifest(m)
+    check_name(m, expected_name(p))
     let dest be lamps_home() + "/lamps/" + p["owner"] + "/" + m["name"]
     let prev_pulled be read_pulled(dest)
     let prev be nothing
@@ -533,6 +551,7 @@ export task pull(ref)
 task pull_local(ref, dir)
     let l be load_lamp(dir)
     let m be l["manifest"]
+    check_name(m, expected_name({"local": true, "dir": dir}))
     let dest be lamps_home() + "/lamps/local/" + m["name"]
     let prev_pulled be read_pulled(dest)
     let prev be nothing
@@ -623,6 +642,14 @@ test "refs resolve like docker refs"
     assert_eq(deep["path"], "lamps/z/")
     assert_eq(deep["name"], "z")
     assert(parse_ref("./mi-lamp")["local"])
+
+test "identity is the address: the expected name comes from repo or folder"
+    assert_eq(expected_name({"local": false, "repo": "frontend", "path": ""}), "frontend")
+    assert_eq(expected_name({"local": false, "repo": "tools", "path": "lamps/scan/"}), "scan")
+    assert_eq(expected_name({"local": true, "dir": "./lamps/git"}), "git")
+    assert_eq(expected_name({"local": true, "dir": "C:/x/my-lamp/"}), "my-lamp")
+    assert(check_name({"name": "scan"}, "scan"))
+    assert_error(() => check_name({"name": "git"}, "innocent"))
 
 test "manifest files cannot escape the lamp folder"
     assert_error(() => safe_rel("../evil"))
