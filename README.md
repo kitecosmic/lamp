@@ -10,8 +10,8 @@ program embedded (`synsema build lamp.syn -o lamp`). No runtime to install, noth
 to download.
 
 ```
-curl -fsSL https://lamps.dev/install | sh        # mac / linux
-irm https://lamps.dev/install.ps1 | iex          # windows
+curl -fsSL https://lamps.sh/install | sh        # mac / linux
+irm https://lamps.sh/install.ps1 | iex          # windows
 ```
 
 ## Two lines to see the point
@@ -98,4 +98,4 @@ a folder per lamp, every line readable before you install anything. That is the 
 
 ## License
 
-MIT
+Apache-2.0

@@ -30,7 +30,7 @@ require sandbox_run
 use "./core.syn" as core
 use "./mcp.syn" as mcp
 
-let VERSION be "0.1.0"
+let VERSION be "0.1.1"
 
 task opt(m, k, d)
     when contains(m, k)
@@ -40,7 +40,7 @@ task opt(m, k, d)
 task usage()
     print("lamp v" + VERSION + " — capabilities with a ceiling, for humans and agents")
     print("")
-    print("  lamp pull <ref>            bring a lamp    (shell · owner/repo · owner/repo@tag · github.com/x/y · ./folder)")
+    print("  lamp pull <ref>            bring a lamp — alias: add    (shell · owner/repo · owner/repo@tag · github.com/x/y · ./folder)")
     print("  lamp update <ref>          pull the latest tag; unchanged hashes = nothing to do")
     print("  lamp list                  every lamp here, with its ceiling and its promise")
     print("  lamp inspect <lamp>        what it asks, what it promises, whether it breaks the promise")
@@ -54,6 +54,7 @@ task usage()
     print("  lamp init                  write ./.lamps/config.json (the project ceiling)")
     print("  lamp skill                 write the agent skill (.agents/skills/lamps/SKILL.md)")
     print("  lamp search [q]            search the hub index")
+    print("  lamp publish <owner/repo>  list your lamp on the hub (a public repo is the identity)")
     print("  lamp version | upgrade | help")
     print("")
     print("A refusal is the system working: the lamp asked, the answer was no, and it is on the record.")
@@ -239,7 +240,7 @@ task cmd_skill()
     print("wrote " + dest)
 
 task cmd_search(q)
-    let hub be env("LAMP_HUB", "https://hub.lamps.dev")
+    let hub be env("LAMP_HUB", "https://lamps.sh")
     let r be http_get(hub + "/api/index.json", {"User-Agent": "lamp"})
     when not r["ok"]
         raise("the hub at " + hub + " is not reachable (status " + text(r["status"]) + ") — lamps also live in plain repos: lamp pull owner/repo")
@@ -269,13 +270,26 @@ task cmd_upgrade()
         give nothing
     print("new version: " + latest + " (you have v" + VERSION + ")")
     print("re-run the installer — it downloads, verifies the sha256 and swaps the binary:")
-    print("  curl -fsSL https://lamps.dev/install | sh          # mac / linux")
-    print("  irm https://lamps.dev/install.ps1 | iex            # windows")
+    print("  curl -fsSL https://lamps.sh/install | sh          # mac / linux")
+    print("  irm https://lamps.sh/install.ps1 | iex            # windows")
+
+task cmd_publish(argv)
+    when length(argv) < 2
+        raise("usage: lamp publish <owner/repo> — push a public repo with lamp.json + lamp.syn at its root, then publish it (the first pull by anyone lists it too)")
+    let ref be argv[1]
+    let p be core.parse_ref(ref)
+    when p["local"]
+        raise("a local folder cannot be listed — push it to a public repo first, then: lamp publish owner/repo")
+    cmd_pull(ref, false)
+    print("")
+    print("sent to the hub — it validates the manifest and the promise, then lists it:")
+    print("  " + env("LAMP_HUB", "https://lamps.sh") + "/l/" + p["owner"] + "/" + p["name"])
+    print("badge for the README:  ![lamp pulls](" + env("LAMP_HUB", "https://lamps.sh") + "/badge/" + p["owner"] + "/" + p["name"] + ".svg)")
 
 -- ── dispatch ────────────────────────────────────────────────────────────────
 
 let COMMANDS be ["help", "--help", "-h", "version", "--version", "list", "inspect",
-                 "pull", "update", "run", "enable", "disable", "mcp", "eval", "audit",
+                 "pull", "add", "update", "run", "enable", "disable", "mcp", "eval", "audit",
                  "init", "skill", "search", "publish", "upgrade"]
 
 task need(argv, i, msg)
@@ -297,7 +311,7 @@ task main()
         cmd_list()
     otherwise when cmd == "inspect"
         cmd_inspect(need(argv, 1, "lamp inspect <lamp>"))
-    otherwise when cmd == "pull"
+    otherwise when cmd == "pull" or cmd == "add"
         cmd_pull(need(argv, 1, "lamp pull <ref>"), false)
     otherwise when cmd == "update"
         cmd_pull(need(argv, 1, "lamp update <ref>"), true)
@@ -325,7 +339,7 @@ task main()
             set q to argv[1]
         cmd_search(q)
     otherwise when cmd == "publish"
-        print("publish: the hub is not open yet — publishing IS pushing the lamp's folder to a public repo (then: lamp pull owner/repo)")
+        cmd_publish(argv)
     otherwise when cmd == "upgrade"
         cmd_upgrade()
     otherwise when length(argv) >= 2 and core.locate(cmd) != nothing

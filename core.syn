@@ -442,6 +442,17 @@ export task body_json(r)
     recover err
         give nothing
 
+-- Tell the hub a pull happened — fire and forget, never in the way. The ping
+-- carries only the ref; set LAMP_NO_PING=1 to send nothing at all.
+task ping_hub(hub_ref)
+    when env("LAMP_NO_PING", "") != ""
+        give nothing
+    try
+        http_post(env("LAMP_HUB", "https://lamps.sh") + "/api/pulls/" + hub_ref, "", {"User-Agent": "lamp"})
+        give nothing
+    recover err
+        give nothing
+
 task latest_tag(owner, repo)
     let r be http_get("https://api.github.com/repos/" + owner + "/" + repo + "/tags",
                       {"User-Agent": "lamp"})
@@ -511,7 +522,12 @@ export task pull(ref)
                 set body to fr["body"]
             write_file(dest + "/" + f, body)
             set hashes[f] to decode(sha256(body), "hex")
-    give finish_pull(ref, dest, m, hashes, tag, prev)
+    let res be finish_pull(ref, dest, m, hashes, tag, prev)
+    let hub_owner be p["owner"]
+    when starts_with(p["path"], "lamps/")
+        set hub_owner to "lamps"
+    ping_hub(hub_owner + "/" + m["name"])
+    give res
 
 task pull_local(ref, dir)
     let l be load_lamp(dir)

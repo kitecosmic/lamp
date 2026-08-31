@@ -3,7 +3,7 @@
 # Every target is the same recipe: the Synsema engine binary for that platform
 # (the donor) + lamp.syn embedded, sealed with a sha256 — `synsema build` does the
 # splice, so one Linux runner cross-builds all four. Assets follow what
-# lamps.dev/install expects: lamp-<os>-<arch>[.exe] + .sha256.
+# lamps.sh/install expects: lamp-<os>-<arch>[.exe] + .sha256.
 name: release
 
 on:
