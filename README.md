@@ -17,9 +17,13 @@ irm https://lamps.sh/install.ps1 | iex          # windows
 ## Two lines to see the point
 
 ```
-$ lamp pull git                 # bring a lamp from github.com/kitecosmic/lamps
+$ lamp pull git                 # bring a lamp from github.com/synsema/lamps (nothing ships pre-installed)
+$ cd some-repo
 $ lamp git log '{"n": 5}'       # run it — under stdout,env=LAMP_*,exec=git and nothing else
 ```
+
+On a terminal the output is shaped for you; piped, or with `--json` anywhere on the
+line, every line is the raw data an agent parses. Same call, same ceiling, same audit.
 
 And the reason the project exists:
 
@@ -40,18 +44,20 @@ ceiling, and asking above the ceiling fails — with the refusal on the record.
 ```
 lamp pull <ref>          bring a lamp     (git · owner/repo · owner/repo@tag · github.com/x/y · ./folder)
 lamp update <ref>        pull the latest tag; unchanged hashes = nothing to do
-lamp list                every lamp here, with its ceiling and its promise
-lamp inspect <lamp>      what it asks, what it promises, whether it breaks the promise
+lamp list                every lamp here, its ceiling, whether agents get it (--json for data)
+lamp inspect <lamp>      what it asks, what it promises, whether it breaks the promise (--json)
 lamp run <lamp> <tool> ['{"json": "args"}']
 lamp <lamp> <tool>       shortcut for run
 lamp enable <name>       offer a pulled lamp to agents — the human act, never a tool
 lamp disable <name>      stop offering it
-lamp mcp                 MCP server over stdio: enabled lamps become the agent's tools
+lamp mcp                 MCP server over stdio: enabled lamps become the agent's tools (typed by hand it waits — that is its job)
 lamp eval '<syn>'        ad-hoc Synsema under the session ceiling (~/.lamps/session.json)
-lamp audit               what was asked, granted, denied — every call, one JSON line each
+lamp audit               what was asked, granted, denied — a table; --json for the raw lines
 lamp init                write ./.lamps/config.json (the project ceiling)
-lamp skill               write the agent skill (.agents/skills/lamps/SKILL.md)
-lamp search [q]          search the hub index
+lamp skill               write the agent skills: lamps itself, plus the SKILL.md each lamp here ships
+lamp search [q]          the hub's catalog — live on a terminal (type to filter, Enter pulls),
+                         a list with a query, --json for data. Every ref shown is pullable:
+                         synsema/<name> is the official set, owner/name any other
 ```
 
 ## How a lamp runs
@@ -88,12 +94,12 @@ installed but not enabled is invisible to the model.
 ```
 git clone https://github.com/kitecosmic/synsema && cd synsema
 cargo install --path engine/crates/synsema-cli          # or grab a release binary
-git clone https://github.com/kitecosmic/lamp && cd lamp
+git clone https://github.com/synsema/lamp && cd lamp
 synsema test core.syn && synsema test lamp.syn          # the self-checks
 synsema build lamp.syn -o lamp                          # one file, done
 ```
 
-The official lamps live in [github.com/kitecosmic/lamps](https://github.com/kitecosmic/lamps) —
+The official lamps live in [github.com/synsema/lamps](https://github.com/synsema/lamps) —
 a folder per lamp, every line readable before you install anything. That is the point.
 
 ## License

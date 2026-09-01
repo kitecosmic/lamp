@@ -54,7 +54,7 @@ task catalog()
                     "inputSchema": opt(t, "parameters", {"type": "object", "properties": {}})})
     give tools
 
-task rows_for_list()
+export task rows_for_list()
     let ses be core.session_conf()
     let ses_ceiling be nothing
     when ses != nothing

@@ -322,8 +322,10 @@ task wrap_run(r, ceiling, prof)
           "ceiling": ceiling, "profile": prof,
           "exit": opt(r, "exit", nothing), "timed_out": opt(r, "timed_out", false)}
 
+-- The engine may check the same capability more than once per run; the audit
+-- records what was granted, not how many times it was asked.
 export task caps_of(entries)
-    give apply((a) => a["capability"], entries)
+    give unique(apply((a) => a["capability"], entries))
 
 export task refusal(r)
     give {"ok": false, "ceiling": r["ceiling"],
@@ -422,9 +424,12 @@ export task parse_ref(ref)
     let segs be where(split(r, "/"), (s) => s != "")
     when length(segs) == 0
         raise("empty ref")
-    when length(segs) == 1
-        give {"local": false, "owner": "kitecosmic", "repo": "lamps",
-              "path": "lamps/" + segs[0] + "/", "name": segs[0], "tag": tag}
+    -- "git" and "synsema/git" are the same lamp: the official set lives in the
+    -- synsema/lamps monorepo, a folder per lamp, and the hub lists it as
+    -- synsema/<name>. The identity the hub shows is always a ref you can pull.
+    when length(segs) == 1 or (length(segs) == 2 and segs[0] == "synsema")
+        give {"local": false, "owner": "synsema", "repo": "lamps",
+              "path": segs[length(segs) - 1] + "/", "name": segs[length(segs) - 1], "tag": tag}
     when length(segs) == 2
         give {"local": false, "owner": segs[0], "repo": segs[1],
               "path": "", "name": segs[1], "tag": tag}
@@ -510,6 +515,42 @@ task finish_pull(ref, dest, m, hashes, tag, prev)
           "lint": lint(m["caps"], l["source"]),
           "changed": not same_hashes(prev, hashes)}
 
+-- The hub lists a monorepo lamp as owner/name and records where it lives:
+-- "https://github.com/owner/repo/tree/<tag>/path/to/name". That is the ref again.
+export task ref_from_repo_url(url)
+    let u be replace_text(replace_text(text_or(url, ""), "https://github.com/", ""), "github.com/", "")
+    when u == ""
+        give nothing
+    let halves be split(u, "/tree/")
+    let head be where(split(halves[0], "/"), (s) => s != "")
+    when length(head) != 2
+        give nothing
+    when length(halves) == 1
+        give head[0] + "/" + head[1]
+    let rest be where(split(halves[1], "/"), (s) => s != "")
+    when length(rest) <= 1
+        give head[0] + "/" + head[1]
+    give head[0] + "/" + head[1] + "/" + join(slice(rest, 1, length(rest)), "/")
+
+-- owner/name is the identity the hub shows. When it is not literally a repo with
+-- lamp.json at its root, the hub knows the folder it lives in.
+task hub_resolve(owner, name)
+    when env("LAMP_NO_HUB", "") != ""
+        give nothing
+    try
+        let r be http_get(env("LAMP_HUB", "https://lamps.sh") + "/api/l/" + owner + "/" + name, {"User-Agent": "lamp"})
+        when not r["ok"]
+            give nothing
+        let l be body_json(r)
+        when type_of(l) != "map"
+            give nothing
+        let ref be ref_from_repo_url(opt(l, "repo", ""))
+        when ref == nothing or ref == owner + "/" + name
+            give nothing
+        give ref
+    recover err
+        give nothing
+
 export task pull(ref)
     let p be parse_ref(ref)
     when p["local"]
@@ -519,8 +560,14 @@ export task pull(ref)
         set tag to latest_tag(p["owner"], p["repo"])
     let base be "https://raw.githubusercontent.com/" + p["owner"] + "/" + p["repo"] + "/" + tag + "/" + p["path"]
     let mr be http_get(base + "lamp.json", {"User-Agent": "lamp"})
+    when not mr["ok"] and p["path"] == ""
+        let via_hub be hub_resolve(p["owner"], p["repo"])
+        when via_hub != nothing
+            when p["tag"] != ""
+                set via_hub to via_hub + "@" + p["tag"]
+            give pull(via_hub)
     when not mr["ok"]
-        raise("cannot fetch " + base + "lamp.json (status " + text(mr["status"]) + ") — does the ref exist? (lamp pull owner/repo[@tag])")
+        raise("cannot fetch " + base + "lamp.json (status " + text(mr["status"]) + ") — does the ref exist? (lamp pull owner/repo[@tag], or owner/name as the hub lists it)")
     let m be json_decode(mr["body"])
     validate_manifest(m)
     check_name(m, expected_name(p))
@@ -542,10 +589,7 @@ export task pull(ref)
             write_file(dest + "/" + f, body)
             set hashes[f] to decode(sha256(body), "hex")
     let res be finish_pull(ref, dest, m, hashes, tag, prev)
-    let hub_owner be p["owner"]
-    when p["owner"] == "kitecosmic" and p["repo"] == "lamps"
-        set hub_owner to "lamps"
-    ping_hub(hub_owner + "/" + m["name"], p["repo"], p["path"])
+    ping_hub(p["owner"] + "/" + m["name"], p["repo"], p["path"])
     give res
 
 task pull_local(ref, dir)
@@ -628,9 +672,9 @@ test "substitute replaces both placeholders everywhere"
 
 test "refs resolve like docker refs"
     let official be parse_ref("shell")
-    assert_eq(official["owner"], "kitecosmic")
+    assert_eq(official["owner"], "synsema")
     assert_eq(official["repo"], "lamps")
-    assert_eq(official["path"], "lamps/shell/")
+    assert_eq(official["path"], "shell/")
     let repo be parse_ref("kitecosmic/postgres@v1.4.2")
     assert_eq(repo["owner"], "kitecosmic")
     assert_eq(repo["tag"], "v1.4.2")
@@ -642,6 +686,25 @@ test "refs resolve like docker refs"
     assert_eq(deep["path"], "lamps/z/")
     assert_eq(deep["name"], "z")
     assert(parse_ref("./mi-lamp")["local"])
+
+test "synsema/<name> is the official set, the same lamp as the bare name"
+    let a be parse_ref("synsema/git")
+    let b be parse_ref("git")
+    assert_eq(a["owner"], b["owner"])
+    assert_eq(a["repo"], b["repo"])
+    assert_eq(a["path"], "git/")
+    assert_eq(a["name"], "git")
+    assert_eq(parse_ref("synsema/git@v0.1.0")["tag"], "v0.1.0")
+    assert_eq(parse_ref("synsema/lamps/git")["path"], "git/")
+    assert_eq(expected_name(a), "git")
+
+test "the hub's repo url becomes a pull ref again"
+    assert_eq(ref_from_repo_url("https://github.com/synsema/lamps/tree/main/shell"), "synsema/lamps/shell")
+    assert_eq(ref_from_repo_url("https://github.com/x/tools/tree/v1.2.0/scan"), "x/tools/scan")
+    assert_eq(ref_from_repo_url("https://github.com/x/y"), "x/y")
+    assert_eq(ref_from_repo_url("https://github.com/x/y/tree/main"), "x/y")
+    assert_eq(ref_from_repo_url(""), nothing)
+    assert_eq(ref_from_repo_url("https://example.com/nope"), nothing)
 
 test "identity is the address: the expected name comes from repo or folder"
     assert_eq(expected_name({"local": false, "repo": "frontend", "path": ""}), "frontend")
